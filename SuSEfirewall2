@@ -118,7 +118,7 @@ syslog()
 	pri="-p auth.warn"
     fi
     shift
-    /bin/logger $dashs $pri -t SuSEfirewall2 "$*"
+    /bin/logger $dashs $pri --id=$$ -t SuSEfirewall2 "$*"
 }
 
 message()
@@ -135,7 +135,14 @@ dbgmessage()
 {
     [ "$MODE" != "debug" ] && return
 
-    message $*
+    message ${FUNCNAME[1]} $*
+}
+
+tracemessage()
+{
+    $TRACE || return
+
+    message ${FUNCNAME[1]} $*
 }
 
 deprecated()
@@ -298,6 +305,7 @@ IP6TABLES_HAVE_REJECT=1
 
 ACTION="start"
 MODE="standard"
+TRACE=false
 INITSCRIPTS="" # on|off
 needconfig=
 needlock=1
@@ -309,7 +317,7 @@ if test -x /usr/bin/tty && ! /usr/bin/tty -s; then
     quiet=1
 fi
 
-getopttmp=`/usr/bin/getopt -o hqi:s: --long help,scriptsdir:,batch,nobatch,file:,debug,test,bootlock,bootunlock,quiet,interface:,service: \
+getopttmp=`/usr/bin/getopt -o hqi:s: --long help,scriptsdir:,batch,nobatch,file:,debug,trace,test,bootlock,bootunlock,quiet,interface:,service: \
      -n 'SuSEfirewall2' -- "$@"`
 
 [ $? != 0 ] && die 1 "getopt error"
@@ -324,6 +332,7 @@ while true ; do
                 --scriptsdir) SCRIPTSDIR="$2" ; shift 2 ;;
                 --test) MODE="test" ; shift ;;
                 --debug) MODE="debug"; needlock=0 ; shift ;;
+                --trace) TRACE=true ; shift ;;
                 --bootlock) create_bootlock=1 ; shift ;;
                 --bootunlock) remove_bootlock=1 ; shift ;;
                 -h|--help) help ; shift ;;
@@ -628,23 +637,53 @@ PROC_IPV6_FWD="/proc/sys/net/ipv6/conf/all/forwarding"
 # checks multiple sysctl.d config locations for configure values
 function get_any_sysctl_cfg()
 {
-	local path="$1"
+	local value="$1"
 
-	for file in /etc/sysctl.conf /etc/sysctl.d/*; do
-		get_sysctl_cfg "$path" "$file" && return 0
+	if [ -z "$FW_SYSCTL_PATHS" ]; then
+		# don't check all available sysctl.d directories for the
+		# reason discussed in bnc#1044523
+		FW_SYSCTL_PATHS="/etc/sysctl.conf /etc/sysctl.d /usr/local/lib/sysctl.d"
+	fi
+
+	local path
+	for path in $FW_SYSCTL_PATHS; do
+		dbgmessage "Checking for sysctl value $value in path $path"
+		if [ -d "$path" ]; then
+			# expand to any config files found in the sysctl.d
+			# style directory
+			paths=$path/*.conf
+			dbgmessage "Expanded $path to $paths"
+		else
+			paths=$path
+		fi
+
+		for file in $paths; do
+			# check for existence, because the wildcard match
+			# above might yield no matches, which would result in
+			# error messages otherwise
+			if [ -r "$file" ]; then
+				dbgmessage "Checking in file $file"
+				get_sysctl_cfg "$value" "$file" && sysctl_file="$file" && return 0
+				dbgmessage "no match"
+			fi
+		done
 	done
 
+	sysctl_file=""
 	return 1
 }
 
-# outputs the configured value of the sysctl setting passed as $1 in the
+# returns the configured value of the sysctl setting passed as $1 in the
 # configuration file $2.
-# return code of 0 if a value was found and output, 1 if none was found
+# return code of 0 if a value was found and returned, 1 if none was found
+#
+# the sysctl setting's value is returned in the sysctl_value variable
 function get_sysctl_cfg()
 {
 	local path="$1"
 	local sysctl="$2"
 	local line
+	sysctl_value=""
 
 	# translate the proc path to a sysctl path
 	syspath=`echo "$path" | /usr/bin/cut -d '/' -f 4- | /usr/bin/tr '/' '.'`
@@ -656,7 +695,7 @@ function get_sysctl_cfg()
 
 	    line=`/usr/bin/grep "^[^#]*$syspath" $sysctl`
 	    if [ $? -eq 0 ]; then
-		    /usr/bin/cut -d '=' -f 2 <<<"$line" | /usr/bin/tr -d ' \t'
+		    sysctl_value=`/usr/bin/cut -d '=' -f 2 <<<"$line" | /usr/bin/tr -d ' \t'`
 		    return 0
 	    fi
 
@@ -690,10 +729,13 @@ function setproc()
 
     [ -z "$path" -o ! -w "$path" ] && return
 
-    cfg_value=`get_any_sysctl_cfg $path` && have_cfg=true || have_cfg=false
+    local sysctl_value=""
+    local sysctl_file=""
+    local have_cfg=false
+    get_any_sysctl_cfg "$path" && have_cfg=true
 
     if $have_cfg; then
-	[ "$cfg_value" = "$value" ] && same_value=true || same_value=false
+	[ "$sysctl_value" = "$value" ] && same_value=true || same_value=false
 
 	# this mode stuff is mostly to allow for backward compatibility
 	# regarding ip forwarding. If forwarding is not explicitly enabled
@@ -701,16 +743,16 @@ function setproc()
 	# what force and reset mode are for.
 	if [ "$mode" = "reset" ]; then
 	    if ! $same_value; then
-		dbgmessage "value for $path in sysctl is different, not resetting it"
+		dbgmessage "value for $path in $sysctl_file is different, not resetting it"
 		# configure value is different, so do nothing
 		return 1
 	    fi
 	elif [ "$mode" = "force" ]; then
 	    if ! $same_value; then
-		warning "value for $path in sysctl.conf is different, but required by firewall, overriding"
+		warning "value for $path in $sysctl_file is different, but required by firewall, overriding"
 	    fi
 	else
-		dbgmessage "$path override in sysctl.conf, not setting it"
+		message "$path override in $sysctl_file, not setting it"
 		return 1
 	fi
     fi
@@ -1445,7 +1487,7 @@ switch_on_ip_forwarding()
     [ "$enabled" -eq 1 ] && return
 
     setproc 1 $PROC_PATH "force"
-    warning "$PROC_PATH is not enabled, you should configure this in /etc/sysctl.conf"
+    warning "$PROC_PATH is not enabled, but required for FW_ROUTE, you should configure this in /etc/sysctl.conf. This option has been implicitly enabled now."
 }
 
 disable_ip_forwarding()
@@ -2232,27 +2274,15 @@ process_trusted_nets()
 # parameter fragment
 #
 # parameters:
-# $1: names of rpc services, e.g. ypbind mountd
-# $2: whether portmapper ports shall be implicitly added (boolean)
+# $1: names of rpc services, e.g. ypbind mountd or a comma separated tuple
+# like 192.168.1.0/24,_rpc_,nfs
 rpcservicerules()
 {
+
     # The -rpcinfo script by default implicitly adds extra rules for portmap
     # itself. This is because portmap needs to be reached in order for other
     # rpc services to work at all.
-    # In some contexts this generates superfluous portmap rules, however. In
-    # conjunction with the update-rpc functionality we might end up with a lot
-    # of redundant rules. Thus we can selectively disabled this implicit
-    # behaviour.
-    # It would be better to only explicitly add the portmap rules. But this
-    # required more refactoring, and also the current solution is buggy: The
-    # implicit portmap rules don't take source subnet restrictions into
-    # account.
-    if [ $# -eq 2 ] && ! $2; then
-	export NOPORTMAP=1
-    fi
-
-    perl "$SCRIPTSDIR/SuSEfirewall2-rpcinfo" "$@" 2>/dev/null
-    unset NOPORTMAP
+    perl "$SCRIPTSDIR/SuSEfirewall2-rpcinfo" "$1"
 }
 
 # parameters:
@@ -2276,7 +2306,7 @@ reject_or_drop_services()
 	chain=input_$zone
 	var="FW_SERVICES_${action}_`cibiz $zone`"
 	eval services="\"\$$var\""
-	
+
 	local rpc_insert
 	get_rpc_insert_pars $update_rpc $chain
 
@@ -2289,25 +2319,30 @@ reject_or_drop_services()
 	    port="$3"
 	    sport="$4"
 
-	    iptables="$IPTABLES $IP6TABLES"
+	    iptables_list=$IPTABLES_LIST
 	    case "$net" in
-		*:*) iptables="$IP6TABLES" ;;
-		[0-9]*.*.*.*) iptables="$IPTABLES" ;;
+		*:*) iptables_list="$IP6TABLES" ;;
+		[0-9]*.*.*.*) iptables_list="$IPTABLES" ;;
 	    esac
 
 	    if [ "$proto" = "_rpc_" ]; then
 		[ -n "$selected" -a "$selected" != $port ] && continue
 		local comment
 		comment_pars "rpc.$port"
+		set -o pipefail
 		rpcservicerules $service | while read ARG; do
-		    $LDC $IPTABLES $rpc_insert $comment ${LOG}"-`rulelog $chain`-$action " -m conntrack --ctstate NEW $ARG
-		    $IPTABLES $rpc_insert $comment -j "$target" $ARG
+			for iptables in $iptables_list; do
+			    $LDC $iptables $rpc_insert $comment ${LOG}"-`rulelog $chain`-$action " -m conntrack --ctstate NEW $ARG
+			    $iptables $rpc_insert $comment -j "$target" $ARG
+			done
 		done
+		[ $? -eq 0 ] || die "Failed to setup rpc service rules for $service"
+		set +o pipefail
 	    elif $update_rpc; then
 	        # don't add any other rules in update rpc mode
 	    	continue
 	    elif check_proto_port "$proto" "$port" "$sport" "$var"; then
-		for iptables in $iptables; do
+		for iptables in $iptables_list; do
 		    $LDA $iptables -A $chain -s $net $proto $port $sport -m conntrack --ctstate NEW ${LOG}"-`rulelog $chain`-$action "
 		    $iptables -A $chain -s $net $proto $port $sport -m conntrack --ctstate NEW -j "$target"
 		done
@@ -2373,31 +2408,36 @@ accept_services()
 		ipt_recent_set="-m recent --set$ipt_recent_set"
 	    fi
 
-	    iptables="$IPTABLES $IP6TABLES"
+	    iptables_list=$IPTABLES_LIST
 	    case "$net" in
-		*:*) iptables="$IP6TABLES" ;;
-		[0-9]*.*.*.*) iptables="$IPTABLES" ;;
+		*:*) iptables_list="$IP6TABLES" ;;
+		[0-9]*.*.*.*) iptables_list="$IPTABLES" ;;
 	    esac
 
 	    if [ "$proto" = "_rpc_" ]; then
 		[ -n "$selected" -a "$selected" != "$port" ] && continue
 		local comment
 		comment_pars "rpc.$port"
+		set -o pipefail
 		rpcservicerules $service | while read ARG; do
-		    if [ -n "$ipt_recent_set" ]; then
-			$LDC $IPTABLES $rpc_insert $comment ${LOG}"-`rulelog $chain`-DROPr " $ARG -m conntrack --ctstate NEW $ipt_recent_rcheck
-			$IPTABLES $rpc_insert $comment -j "$DROP" $ARG -m conntrack --ctstate NEW $ipt_recent_update
-		    fi
-		    $LAC $IPTABLES $rpc_insert $comment ${LOG}"-`rulelog $chain`-ACC " -m conntrack --ctstate NEW $ARG
-		    $LAA $IPTABLES $rpc_insert $comment ${LOG}"-`rulelog $chain`-ACC " $ARG
-		    [ -n "$ipt_recent_set" ] && $IPTABLES $rpc_insert $comment -j ACCEPT $ARG -m conntrack --ctstate NEW $ipt_recent_set
-		    $IPTABLES $rpc_insert $comment -j ACCEPT $ARG
+			for iptables in $iptables_list; do
+			    if [ -n "$ipt_recent_set" ]; then
+				$LDC $iptables $rpc_insert $comment ${LOG}"-`rulelog $chain`-DROPr " $ARG -m conntrack --ctstate NEW $ipt_recent_rcheck
+				$iptables $rpc_insert $comment -j "$DROP" $ARG -m conntrack --ctstate NEW $ipt_recent_update
+			    fi
+			    $LAC $iptables $rpc_insert $comment ${LOG}"-`rulelog $chain`-ACC " -m conntrack --ctstate NEW $ARG
+			    $LAA $iptables $rpc_insert $comment ${LOG}"-`rulelog $chain`-ACC " $ARG
+			    [ -n "$ipt_recent_set" ] && $iptables $rpc_insert $comment -j ACCEPT $ARG -m conntrack --ctstate NEW $ipt_recent_set
+			    $iptables $rpc_insert $comment -j ACCEPT $ARG
+			done
 		done
+		[ $? -eq 0 ] || die "Failed to setup rpc service rules for $service"
+		set +o pipefail
 	    elif $update_rpc; then
 	        # don't add any other rules in update rpc mode
 	    	continue
 	    elif check_proto_port "$proto" "$port" "$sport" "$var"; then
-		for iptables in $iptables; do
+		for iptables in $iptables_list; do
 		    if [ -n "$ipt_recent_set" ]; then
 			$LDC $iptables -A $chain ${LOG}"-`rulelog $chain`-DROPr " -s $net $proto $port $sport -m conntrack --ctstate NEW $ipt_recent_rcheck
 			$iptables -A $chain -j "$DROP" -s $net $proto $port $sport -m conntrack --ctstate NEW $ipt_recent_update
@@ -2425,7 +2465,7 @@ allow_rpc_services()
 {
 	local zone chain services comment
 	local selected="$1"
-	[ -z "$add_portmapper" ] && add_portmapper=true
+	[ -z "$add_portmapper" ] && local add_portmapper=true
 	[ -z "$update_rpc" ] && update_rpc=false
 
 	for zone in $input_zones; do
@@ -2443,11 +2483,16 @@ allow_rpc_services()
 			# skip not matching services for incremental updates
 			[ -n "$selected" -a "$selected" != "$service" -a "$service" != "portmapper" ] && continue
 			comment_pars "rpc.$service"
-			rpcservicerules $service false | while read ARG; do
-				$LAC $IPTABLES $rpc_insert $comment ${LOG}"-`rulelog $chain`-ACC-RPC " -m conntrack --ctstate NEW $ARG
-				$LAA $IPTABLES $rpc_insert $comment ${LOG}"-`rulelog $chain`-ACC-RPC " $ARG
-				$IPTABLES $rpc_insert $comment -j "$ACCEPT" $ARG
+			set -o pipefail
+			rpcservicerules $service | while read ARG; do
+				for iptables in $IPTABLES_LIST; do
+					$LAC $iptables $rpc_insert $comment ${LOG}"-`rulelog $chain`-ACC-RPC " -m conntrack --ctstate NEW $ARG
+					$LAA $iptables $rpc_insert $comment ${LOG}"-`rulelog $chain`-ACC-RPC " $ARG
+					$iptables $rpc_insert $comment -j "$ACCEPT" $ARG
+				done
 			done
+			[ $? -eq 0 ] || die "failed to setup rpc service rules for $service"
+			set +o pipefail
 		done
 	done
 }
@@ -2856,12 +2901,12 @@ drop_all()
     local chain
     local zone
     local drop
-    local chainprefix='input_'
     local comment
     comment_pars "insert.pos"
 
 	for iptables in $IPTABLES_LIST; do
 	    local icmp_type=icmp
+	    local chainprefix='input_'
 	    [ $iptables = $IP6TABLES ] && icmp_type=icmpv6
 
 		for zone in $input_zones '--' $forward_zones; do
@@ -2916,9 +2961,79 @@ drop_all()
 	done
 }
 
+# bnc#1069760
+# in some circumstances like with rpc service rules for portmapper
+# port 111 we can end up with duplicate rules in the rule set. It's
+# difficult to avoid setting them in the first place due to
+# customizations by users, different packages dropping rpc service
+# files not according to standard (specifying portmap instead of portmapper),
+# therefore we're implicitly adding portmapper for each rpc service setup ...
+#
+# so this is not elegant but involves the smallest risk of breaking
+# something: iterate over the rules we've set know and remove unneeded
+# ones
+function erase_duplicates
+{
+	for zone in $all_zones; do
+		for chain in input forward; do
+			chain="${chain}_${zone}"
+			# use _BIN variants here, to avoid iptables-batch
+			# getting in our way
+			for iptables in $IPTABLES_BIN $IP6TABLES_BIN; do
+				erase_duplicates_in_chain "$iptables" "$chain"
+			done
+		done
+	done
+}
+
+function erase_duplicates_in_chain
+{
+	local iptables="$1"
+	local chain="$2"
+
+	[ -z "$chain" -o -z "$iptables" ] && return 1
+
+	# keep track of duplicate rules via an associative array
+	declare -A ruleset
+	declare -A rulemap
+
+	local ORIG_IFS="$IFS"
+	local replace='s/-m comment --comment "[^"]\+" //g'
+	local rulenum=1
+	local dups=""
+	local rule
+
+	# - tail: ignore the first rule (chain creation rule, not counted)
+	# - sed: cut out the comments from the rules, because equal rules
+	#        can have different comments for the update-rpc logic
+
+	IFS=$'\n'; for rule in `$iptables -S "$chain" | /usr/bin/tail -n +2 | /usr/bin/sed $replace`; do
+		if [ ${ruleset[$rule]+abc} ]; then
+			# it's important to put higher numbers first, because
+			# otherwise we'll screw up order upon delete
+			dups="$rulenum $dups"
+		else
+			ruleset[$rule]=true
+		fi
+
+		rulemap[$rulenum]=$rule
+		rulenum=$(($rulenum + 1))
+	done
+
+	IFS="$ORIG_IFS"
+
+	for rulenum in $dups; do
+		rule=${rulemap[$rulenum]}
+		tracemessage "Removing duplicate rule nr. $rulenum from $chain: $rule"
+		$iptables -D "$chain" $rulenum
+	done
+}
+
 # perform some final actions after all rules have been setup
 function fw_after_finished
 {
+	erase_duplicates
+
 	# check whether libvirtd is running and trigger it to reinstate
 	# firewall rules, if necessary. See bsc#884398
 	/bin/systemctl --quiet is-active libvirtd || return
